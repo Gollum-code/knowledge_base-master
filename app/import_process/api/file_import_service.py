@@ -1,5 +1,4 @@
 import os
-import shutil
 import uuid
 from typing import List, Dict, Any
 from datetime import datetime
@@ -38,10 +37,13 @@ app = FastAPI(
 )
 
 # 跨域中间件配置：解决前端调用后端接口的跨域限制
+# 允许来源从环境变量读取，未配置时默认全放行（内网演示）
+# 生产环境建议配置为具体域名列表，如：CORS_ALLOWED_ORIGINS=https://kb.example.com
+_allowed_origins = [o.strip() for o in os.getenv("CORS_ALLOWED_ORIGINS", "*").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 允许所有前端域名访问（生产环境建议指定具体域名）
-    allow_credentials=True,  # 允许携带Cookie等认证信息
+    allow_origins=_allowed_origins,  # 允许所有前端域名访问（生产环境建议指定具体域名）
+    allow_credentials=_allowed_origins != ["*"],  # 仅具体域名时才允许携带Cookie等认证信息
     allow_methods=["*"],  # 允许所有HTTP方法（GET/POST/PUT/DELETE等）
     allow_headers=["*"],  # 允许所有请求头
 )
@@ -56,6 +58,28 @@ _ASSETS_DIR = _PAGE_DIR / "assets"
 
 if _ASSETS_DIR.exists():
     app.mount("/assets", StaticFiles(directory=_ASSETS_DIR), name="import_assets")
+
+
+# --------------------------
+# 可选鉴权 & 上传安全配置
+# --------------------------
+# 配置了 API_AUTH_TOKEN 后，/upload 与 /status 需要携带 Bearer Token 才能访问
+_api_auth_token = os.getenv("API_AUTH_TOKEN", "").strip()
+# 允许上传的文件扩展名白名单
+_ALLOWED_UPLOAD_EXTS = {".pdf", ".md", ".txt", ".doc", ".docx"}
+# 单文件大小上限（默认 200MB）
+_MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE_BYTES", 200 * 1024 * 1024))
+
+
+@app.middleware("http")
+async def _upload_auth_middleware(request: Request, call_next):
+    if _api_auth_token:
+        path = request.url.path
+        protected = path == "/upload" or path.startswith("/status/")
+        if protected and request.headers.get("Authorization", "") != f"Bearer {_api_auth_token}":
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    return await call_next(request)
 
 
 def _serve_import_page():
@@ -158,7 +182,19 @@ async def upload_files(background_tasks: BackgroundTasks, files: List[UploadFile
         # 生成全局唯一TaskID（UUID4），作为单个文件的全流程标识
         task_id = str(uuid.uuid4())
         task_ids.append(task_id)
-        logger.info(f"[{task_id}] 开始处理上传文件，文件名：{file.filename}，文件类型：{file.content_type}")
+
+        # 文件名安全清洗：仅保留 basename，防止路径穿越（../ 或绝对路径）
+        raw_filename = (file.filename or "").replace("\\", "/").split("/")[-1].strip()
+        if not raw_filename or raw_filename in (".", ".."):
+            raise HTTPException(status_code=400, detail="非法文件名")
+        # 扩展名白名单校验
+        ext = os.path.splitext(raw_filename)[1].lower()
+        if ext not in _ALLOWED_UPLOAD_EXTS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"不支持的文件类型: {ext or '无扩展名'}，仅支持 {'/'.join(sorted(_ALLOWED_UPLOAD_EXTS))}",
+            )
+        logger.info(f"[{task_id}] 开始处理上传文件，文件名：{raw_filename}，文件类型：{file.content_type}")
 
         # 3. 创建 SSE 队列并标记「文件上传」阶段为「运行中」
         create_sse_queue(task_id)
@@ -169,18 +205,32 @@ async def upload_files(background_tasks: BackgroundTasks, files: List[UploadFile
         task_local_dir = os.path.join(date_based_root_dir, task_id)
         os.makedirs(task_local_dir, exist_ok=True)  # 目录不存在则创建，存在则不做处理
         # 构建上传文件的本地保存绝对路径
-        local_file_abs_path = os.path.join(task_local_dir, file.filename)
+        local_file_abs_path = os.path.join(task_local_dir, raw_filename)
 
-        # 5. 将上传的文件保存到本地临时目录（后续MinIO上传/文件解析均基于此文件）
+        # 5. 将上传的文件保存到本地临时目录（流式写入并校验大小上限）
+        # 后续MinIO上传/文件解析均基于此文件
+        written = 0
         with open(local_file_abs_path, "wb") as file_buffer:
-            shutil.copyfileobj(file.file, file_buffer)
-        logger.info(f"[{task_id}] 文件已保存至本地，路径：{local_file_abs_path}")
+            while True:
+                chunk = file.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > _MAX_FILE_SIZE:
+                    file_buffer.close()
+                    os.remove(local_file_abs_path)
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"文件超过大小上限（{_MAX_FILE_SIZE // (1024 * 1024)}MB）：{raw_filename}",
+                    )
+                file_buffer.write(chunk)
+        logger.info(f"[{task_id}] 文件已保存至本地，路径：{local_file_abs_path}，大小：{written} 字节")
 
         # 6. 将本地文件上传至MinIO对象存储，做持久化保存
         # 从环境变量获取MinIO的PDF存储目录配置
         minio_pdf_base_dir = os.getenv("MINIO_PDF_DIR", "pdf_files")  # 缺省值：pdf_files
         # 构建MinIO中的文件对象名：配置目录/YYYYMMDD/文件名（按日期分层，和本地一致）
-        minio_object_name = f"{minio_pdf_base_dir}/{datetime.now().strftime('%Y%m%d')}/{file.filename}"
+        minio_object_name = f"{minio_pdf_base_dir}/{datetime.now().strftime('%Y%m%d')}/{raw_filename}"
         try:
             # 获取MinIO客户端实例
             minio_client = get_minio_client()

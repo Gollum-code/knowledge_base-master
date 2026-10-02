@@ -4,6 +4,7 @@ import re
 from collections import deque
 from pathlib import Path
 from typing import List, Tuple, Dict
+from urllib.parse import quote
 
 from langchain_core.exceptions import LangChainException
 from langchain_core.messages import HumanMessage
@@ -122,30 +123,42 @@ class NodeMdImg(NodeBase):
     def _step_2_scan_images(self, md_content: str, images_dir: Path) -> List[Tuple[str, str, Tuple[str, str]]]:
         """
         扫描图片文件夹，过滤出「支持格式+MD中实际引用」的图片，组装处理元数据
+        优化：对MD内容做单次正则扫描建立「文件名→上下文」映射，
+        避免为每张图片重复全量扫描MD内容（原实现为 O(图片数×MD长度)）
         :param md_content: MD文件完整内容
         :param images_dir: 图片文件夹路径对象
         :return: 待处理图片列表，每个元素为(图片文件名, 图片完整路径, 图片上下文)元组
         """
+        # 先收集图片文件夹中支持格式的文件名
+        supported = {
+            fn for fn in os.listdir(images_dir)
+            if self._is_supported_image(fn)
+        }
+        if not supported:
+            logger.info("图片文件夹中无可支持的图片格式，跳过后续处理")
+            return []
+
         targets = []
-        # 遍历图片文件夹所有文件
-        for image_file in os.listdir(images_dir):
-            # 过滤非支持格式的图片
-            if not self._is_supported_image(image_file):
-                logger.debug(f"图片格式不支持，跳过：{image_file}")
-                continue
+        # 单次扫描MD中所有图片引用，建立文件名→首个上下文映射
+        md_img_pattern = re.compile(r"!\[.*?\]\(([^)]*?)\)")
+        ref_contexts: Dict[str, Tuple[str, str]] = {}
+        for m in md_img_pattern.finditer(md_content):
+            url_part = m.group(1)
+            # 提取URL中的纯文件名（忽略查询参数、锚点、路径）
+            filename = url_part.split("?")[0].split("#")[0].split("/")[-1]
+            if filename in supported and filename not in ref_contexts:
+                start, end = m.span()
+                pre_text = md_content[max(0, start - 100):start]
+                post_text = md_content[end:min(len(md_content), end + 100)]
+                ref_contexts[filename] = (pre_text.strip(), post_text.strip())
 
-            # 组装图片完整路径
-            img_path = str(images_dir / image_file)
-            # 查找图片在MD中的引用上下文
-            context_list = self._find_image_in_md(md_content, image_file)
-
-            # 过滤MD中未引用的图片
-            if not context_list:
+        for image_file in supported:
+            context = ref_contexts.get(image_file)
+            if context is None:
                 logger.warning(f"图片未在MD中引用，跳过处理：{image_file}")
                 continue
-
-            # 组装待处理图片元数据，取第一个匹配的上下文
-            targets.append((image_file, img_path, context_list[0]))
+            img_path = str(images_dir / image_file)
+            targets.append((image_file, img_path, context))
             logger.info(f"图片加入待处理列表：{image_file}")
 
         logger.info(f"图片扫描完成，共筛选出待处理图片：{len(targets)} 张")
@@ -407,14 +420,14 @@ class NodeMdImg(NodeBase):
                 content_type=f"image/{os.path.splitext(local_path)[1][1:]}"
             )
 
-            # 处理路径特殊字符，避免URL解析错误
-            object_name = object_name.replace("\\", "%5C")
             # 根据配置选择HTTP/HTTPS协议
             protocol = "https" if minio_config.minio_secure else "http"
             # 构造MinIO基础访问URL
             base_url = f"{protocol}://{minio_config.endpoint}/{minio_config.bucket_name}"
+            # 对对象名做URL编码（保留路径分隔符/），处理中文/空格/特殊字符，避免图片无法访问
+            encoded_object_name = quote(object_name, safe="/")
             # 拼接完整图片访问URL
-            img_url = f"{base_url}{object_name}"
+            img_url = f"{base_url}{encoded_object_name}"
             logger.info(f"图片上传成功，访问URL：{img_url}")
             return img_url
         except Exception as e:

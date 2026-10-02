@@ -1,10 +1,41 @@
 import sys
 import json
 import asyncio
+import threading
 from app.utils.task_utils import add_done_task, add_running_task
 from app.conf.bailian_mcp_config import mcp_config
 from agents.mcp import MCPServerStreamableHttp
 from app.core.logger import logger
+
+
+def run_mcp_call(query: str):
+    """
+    安全地运行异步 MCP 调用：
+    - 若当前线程没有运行中的事件循环（如线程池/后台线程），直接 asyncio.run
+    - 若当前线程已有运行中的事件循环（如在事件循环线程中被同步调用），
+      则另起一个线程执行，避免 "asyncio.run() cannot be called from a running event loop" 错误
+    """
+    try:
+        asyncio.get_running_loop()
+        # 已有运行中的事件循环 -> 新开线程执行
+        box = {}
+
+        def _runner():
+            try:
+                box["result"] = asyncio.run(mcp_call(query))
+            except Exception as e:  # pragma: no cover
+                logger.error(f"[MCP] 子线程执行 mcp_call 异常: {e}", exc_info=True)
+                box["error"] = e
+
+        thread = threading.Thread(target=_runner, daemon=True)
+        thread.start()
+        thread.join()
+        if "error" in box:
+            raise box["error"]
+        return box.get("result")
+    except RuntimeError:
+        # 没有运行中的事件循环 -> 直接执行
+        return asyncio.run(mcp_call(query))
 
 
 def node_web_search_mcp(state):
@@ -32,7 +63,7 @@ def node_web_search_mcp(state):
     # 3. 执行搜索
     if query:
         try:
-            # 同步-异步桥接：通过asyncio.run()执行异步的mcp_call函数
+            # 同步-异步桥接：通过run_mcp_call安全执行异步的mcp_call函数
             logger.info(f"启动异步 MCP 调用，Query: {query}")
 
             # ======================================================================
@@ -56,7 +87,7 @@ def node_web_search_mcp(state):
             # }
             # """
             # ======================================================================
-            result = asyncio.run(mcp_call(query))
+            result = run_mcp_call(query)
 
             # 4. 解析结果
             if result and not result.isError and result.content:

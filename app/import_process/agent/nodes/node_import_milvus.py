@@ -83,18 +83,26 @@ class NodeImportMilvus(NodeBase):
             logger.error("Milvus入库校验失败：chunks非列表类型或为空列表")
             raise ValueError("错误: chunks数据格式不正确，必须为非空列表")
         # 校验3：切片包含dense_vector字段（向量化节点核心产出）
-        first_chunk = chunks_json_data[0]
-        if 'dense_vector' not in first_chunk:
-            logger.error("Milvus入库校验失败：切片缺失dense_vector字段，上游向量化节点可能执行失败")
+        # 过滤掉缺少向量的切片（如向量化失败保留的原数据），避免整批入库失败
+        valid_chunks = [
+            c for c in chunks_json_data
+            if isinstance(c, dict) and c.get("dense_vector") is not None and len(c["dense_vector"]) > 0
+        ]
+        if len(valid_chunks) != len(chunks_json_data):
+            logger.warning(
+                f"Milvus入库过滤：{len(chunks_json_data) - len(valid_chunks)}条切片缺少向量字段（可能为向量化失败数据），已跳过")
+        if not valid_chunks:
+            logger.error("Milvus入库校验失败：全部切片均缺少dense_vector字段，上游向量化节点可能执行失败")
             raise ValueError("错误: 数据中缺失dense_vector字段，请检查上游向量化节点执行状态")
 
         # 提取向量维度和商品名称，用于后续集合创建/日志展示
+        first_chunk = valid_chunks[0]
         vector_dimension = len(first_chunk['dense_vector'])
         item_name = first_chunk.get('item_name', '未知商品名')
         logger.info(
-            f"Milvus入库校验通过，待入库切片数：{len(chunks_json_data)} | 向量维度：{vector_dimension} | 商品名称：{item_name}")
+            f"Milvus入库校验通过，待入库切片数：{len(valid_chunks)} | 向量维度：{vector_dimension} | 商品名称：{item_name}")
 
-        return chunks_json_data, vector_dimension
+        return valid_chunks, vector_dimension
 
 
 

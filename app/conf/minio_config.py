@@ -18,6 +18,13 @@ class MinIOConfig:
     minio_secure: bool # 是否使用ssl加密 http 还是 https
 
 
+# 环境变量布尔解析：兼容 1/0/true/false/yes/no（不区分大小写）
+def env_bool(key: str, default: bool = False) -> bool:
+    val = os.getenv(key)
+    if val is None or val == "":
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
 # 实例化MinIO配置对象，自动从.env读取配置并绑定
 minio_config = MinIOConfig(
     endpoint=os.getenv("MINIO_ENDPOINT"),
@@ -25,5 +32,5 @@ minio_config = MinIOConfig(
     secret_key=os.getenv("MINIO_SECRET_KEY"),
     bucket_name=os.getenv("MINIO_BUCKET_NAME"),
     minio_img_dir=os.getenv("MINIO_IMG_DIR"),
-    minio_secure=os.getenv("MINIO_SECURE") == "True"
+    minio_secure=env_bool("MINIO_SECURE", False)
 )

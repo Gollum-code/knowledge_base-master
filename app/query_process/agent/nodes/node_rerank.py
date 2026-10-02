@@ -1,8 +1,6 @@
 import sys
-from app.utils.task_utils import *
 
 from dotenv import load_dotenv
-import sys
 
 from app.core.logger import logger
 from app.lm.reranker_utils import get_reranker_model
@@ -28,7 +26,7 @@ def node_rerank(state):
   Rerank节点
   对检索到的文档进行重新排序，提高相关性
   """
-  print("---Rerank---")
+  logger.info("---Rerank---")
   add_running_task(state["session_id"], sys._getframe().f_code.co_name, state.get("is_stream"))
 
   # 阶段一：合并文档
@@ -37,7 +35,7 @@ def node_rerank(state):
   scored_docs = step_2_rerank_docs(state, doc_items)
   # 阶段三：动态 TopK
   topk_docs = step_3_topk(scored_docs)
-  print("最终文档:",  topk_docs )
+  logger.info(f"最终文档数：{len(topk_docs)}")
 
   add_done_task(state['session_id'], sys._getframe().f_code.co_name, state.get("is_stream"))
   return {"reranked_docs": topk_docs}

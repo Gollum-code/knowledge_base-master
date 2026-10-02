@@ -4,7 +4,6 @@ import json
 import logging
 from typing import List, Dict, Any, Optional
 from langchain_core.messages import SystemMessage, HumanMessage
-from mpmath import limit
 
 from app.core.load_prompt import load_prompt
 from app.query_process.agent.state import QueryGraphState
@@ -17,6 +16,9 @@ from dotenv import load_dotenv,find_dotenv
 from app.core.logger import logger
 
 load_dotenv(find_dotenv())
+
+# 历史消息条数常量（替代硬编码）
+HISTORY_LIMIT = 10
 
 
 def node_item_name_confirm(state: QueryGraphState) -> QueryGraphState:
@@ -33,7 +35,7 @@ def node_item_name_confirm(state: QueryGraphState) -> QueryGraphState:
     add_running_task(session_id, "node_item_name_confirm", is_stream)
 
     # 1. 获取历史记录
-    history = get_recent_messages(session_id, limit=10)
+    history = get_recent_messages(session_id, limit=HISTORY_LIMIT)
     logger.info(f"Node: 获取到 {len(history)} 条历史消息")
 
     # 2. 保存用户当前消息 (初始保存，后续 step 7 会更新)
@@ -143,9 +145,22 @@ def step_3_extract_info(query, history) -> Dict:
         # print("node_item_name_confirm  response:", response)
         # 提取响应中的文本内容
         content = response.content
+        # 兼容不同 LLM 返回格式：content 可能是字符串或消息列表
+        if isinstance(content, list):
+            content = "".join(getattr(c, "content", "") or "" for c in content if isinstance(c, dict))
+        content = content.strip()
         # 处理LLM可能返回的代码块格式（如```json ... ```），去除包裹符
-        if content.startswith("```json"):
-            content = content.replace("```json", "").replace("```", "")
+        if content.startswith("```"):
+            content = content.strip("`").strip()
+            if content.startswith("json"):
+                content = content[4:].strip()
+
+        # 提取 JSON 对象片段（兼容模型额外输出的说明文字）
+        if not content.startswith("{"):
+            start_idx = content.find("{")
+            end_idx = content.rfind("}")
+            if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                content = content[start_idx:end_idx + 1]
 
         # 将处理后的文本转为JSON字典，解析LLM返回结果
         result = json.loads(content)

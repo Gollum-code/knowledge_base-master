@@ -6,6 +6,13 @@ from dotenv import load_dotenv
 # 提前加载.env配置文件（保持和原代码一致，只需执行一次）
 load_dotenv()
 
+# 环境变量布尔解析：兼容 1/0/true/false/yes/no（不区分大小写）
+def env_bool(key: str, default: bool = False) -> bool:
+    val = os.getenv(key)
+    if val is None or val == "":
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
 @dataclass
 class RerankerConfig:
     bge_reranker_large: str  # 本地模型路径
@@ -17,5 +24,5 @@ reranker_config = RerankerConfig(
     bge_reranker_large=os.getenv("BGE_RERANKER_LARGE"),
     bge_reranker_device=os.getenv("BGE_RERANKER_DEVICE"),
     # 特殊处理：将.env中的1/0转为布尔值，兼容常见的数字/字符串格式
-    bge_reranker_fp16=os.getenv("BGE_RERANKER_FP16") in ("1", "True", "true", 1)
+    bge_reranker_fp16=env_bool("BGE_RERANKER_FP16", False)
 )

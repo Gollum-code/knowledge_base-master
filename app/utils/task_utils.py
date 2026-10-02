@@ -1,4 +1,5 @@
 from typing import Dict, List
+from time import time
 from .sse_utils import push_to_session
 
 # ---------------------------
@@ -16,6 +17,13 @@ _tasks_status: Dict[str, str] = {}
 # key: task_id
 # value: 任务结果（例如 query 的 answer）
 _tasks_result: Dict[str, Dict[str, str]] = {}
+
+# key: task_id
+# value: 任务创建时间戳（用于过期清理，防止内存无限增长）
+_tasks_created_at: Dict[str, float] = {}
+
+# 任务数据保留时长（秒）：超过后自动清理，默认 1 小时
+TASK_DATA_RETENTION_SECONDS = 3600
 
 TASK_STATUS_PENDING = "pending"
 TASK_STATUS_PROCESSING = "processing"
@@ -58,6 +66,21 @@ def _ensure_task(task_id: str) -> None:
         _tasks_done_list[task_id] = []
     if task_id not in _tasks_result:
         _tasks_result[task_id] = {}
+    if task_id not in _tasks_created_at:
+        _tasks_created_at[task_id] = time()
+
+
+def _cleanup_expired_tasks() -> None:
+    """清理超过保留时长的任务数据，避免内存无限增长（懒触发）。"""
+    if not _tasks_created_at:
+        return
+    now = time()
+    expired = [
+        tid for tid, ts in _tasks_created_at.items()
+        if now - ts > TASK_DATA_RETENTION_SECONDS
+    ]
+    for tid in expired:
+        clear_task(tid)
 
 
 def _to_cn(node_name: str) -> str:
@@ -167,6 +190,8 @@ def update_task_status(task_id: str, status_name: str, push_queue: bool = False)
     - status_name: 状态名称（字符串）
     """
     _tasks_status[task_id] = status_name
+    # 懒触发过期任务清理，避免长期运行内存无限增长
+    _cleanup_expired_tasks()
     if push_queue:
         task_push_queue(task_id)
 
@@ -185,5 +210,6 @@ def clear_task(task_id: str):
     _tasks_done_list.pop(task_id, None)
     _tasks_status.pop(task_id, None)
     _tasks_result.pop(task_id, None)
+    _tasks_created_at.pop(task_id, None)
 
 
