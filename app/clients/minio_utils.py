@@ -4,6 +4,7 @@ import json
 from minio import Minio
 # 项目内部配置与日志
 from app.conf.minio_config import minio_config
+from app.conf.settings import settings
 from app.core.logger import logger
 
 # 全局MinIO客户端对象，首次调用 get_minio_client() 时懒加载
@@ -48,11 +49,14 @@ def _init_minio_client():
                 "Effect": "Allow",
                 "Principal": {"AWS": ["*"]},
                 "Action": ["s3:GetObject"],
-                "Resource": [f"arn:aws:s3:::{bucket_name}/*"],
+                # 仅公开图片目录（MINIO_IMG_DIR / MINIO_PUBLIC_PREFIX 配置的前缀），
+                # 其余对象（PDF 等）不再匿名可读，需通过签名 URL 访问
+                "Resource": [f"arn:aws:s3:::{bucket_name}{settings.minio_public_prefix}/*"],
             }],
         }
         client.set_bucket_policy(bucket_name, json.dumps(bucket_policy))
-        logger.info(f"MinIO存储桶[{bucket_name}]已配置公网只读策略，支持匿名URL访问")
+        logger.info(
+            f"MinIO存储桶[{bucket_name}]已配置公网只读策略（仅前缀 {settings.minio_public_prefix}），支持匿名URL访问")
 
         minio_client = client
         return minio_client

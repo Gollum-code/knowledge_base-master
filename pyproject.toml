@@ -26,6 +26,7 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "openai-agents>=0.13.5",
     "dashscope>=1.25.16",
+    "pydantic-settings>=2.3.0",
 ]
 
 [tool.uv.sources]
@@ -38,3 +39,8 @@ torchaudio = { index = "pytorch-cuda" }
 name = "pytorch-cuda"
 url = "https://download.pytorch.org/whl/cu121"
 explicit = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

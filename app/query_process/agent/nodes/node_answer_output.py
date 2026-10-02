@@ -4,13 +4,15 @@ from app.utils.task_utils import add_running_task, add_done_task, set_task_resul
 from app.utils.sse_utils import push_to_session, SSEEvent
 from app.query_process.agent.state import QueryGraphState
 from app.core.logger import logger
+from app.conf.settings import settings
 from app.core.load_prompt import load_prompt
 from app.lm.lm_utils import get_llm_client
 from app.clients.mongo_history_utils import save_chat_message
 import re
 
 _IMAGE_BLOCK_MARKER = "【图片】"
-MAX_CONTEXT_CHARS = 12000
+# 兼容常量：仍保留变量名，但实际值从集中配置读取
+MAX_CONTEXT_CHARS = settings.context_max_chars
 
 
 def _build_sources(reranked_docs):
@@ -140,17 +142,16 @@ def step_2_construct_prompt(state: QueryGraphState) -> str:
     # 2 从重排内容中，提取为资料字符串，不可超过限额
     # 优先使用结构化 reranked_docs（包含 source/chunk_id/url/score），便于约束与引用
     # ---------------------------------------------------------
-    # 逻辑解释：
-    # 1. 遍历重排序后的文档列表 (reranked_docs)，这些文档已经按相关性从高到低排序。
-    # 2. 对每个文档提取关键信息 (text, source, chunk_id, url, title, score)。
-    # 3. 构造 "元数据头 + 正文" 格式的字符串，例如：
-    #    "[1] [local] [chunk_id=123] [score=0.95] [title=操作手册]
-    #     这里是文档的正文内容..."
-    # 4. 累加字符长度，如果超过 MAX_CONTEXT_CHARS (如 12000 字符)，则停止添加，
-    #    确保 Prompt 长度在 LLM 的处理范围内，避免 Token 溢出。
+    # 逻辑解释（token 配额分配）：
+    # 1. 从集中配置读取总字符上限 MAX_CONTEXT_CHARS。
+    # 2. 按 context_docs_ratio 分配文档配额、context_history_ratio 分配历史配额。
+    # 3. 文档优先使用数据（保证检索质量），历史记录使用剩余配额，互不挤占。
     # ---------------------------------------------------------
+    docs_budget = int(MAX_CONTEXT_CHARS * settings.context_docs_ratio)
+    history_budget = int(MAX_CONTEXT_CHARS * settings.context_history_ratio)
+
     docs = []
-    used = 0
+    used_docs = 0
     for i, doc in enumerate(reranked_docs, start=1):
         text = (doc.get("text") or "").strip()
         if not text:
@@ -173,12 +174,12 @@ def step_2_construct_prompt(state: QueryGraphState) -> str:
             meta_parts.append(f"[score={float(score):.4f}]")
         if title:
             meta_parts.append(f"[title={title}]")
-        doc = " ".join(meta_parts) + "\n" + text
-        if used + len(doc) > MAX_CONTEXT_CHARS:
+        doc_str = " ".join(meta_parts) + "\n" + text
+        if used_docs + len(doc_str) > docs_budget:
             break
-        docs.append(doc)
+        docs.append(doc_str)
         # 计算使用长度！ + 2 两个\n\n
-        used += len(doc) + 2
+        used_docs += len(doc_str) + 2
     context_str = "\n\n".join(docs) if docs else "无参考内容"
 
     # 3. 格式化 History (历史对话)
@@ -186,25 +187,26 @@ def step_2_construct_prompt(state: QueryGraphState) -> str:
     # 逻辑解释：
     # 1. 遍历历史对话记录 (history)。
     # 2. 将每轮对话格式化为 "用户: ... \n 助手: ..." 的文本块。
-    # 3. 同样进行长度累加判断 (used)，确保历史记录+参考文档的总长度不超过 MAX_CONTEXT_CHARS。
-    #    注意：这里的 used 变量是接着上面处理文档后的长度继续累加的，
-    #    意味着如果文档占用了太多 Token，历史记录可能会被截断或完全丢弃。
+    # 3. 使用历史专用配额 history_budget，与文档配额相互独立。
     # ---------------------------------------------------------
     history_str = ""
     if history:
+        used_history = 0
         for msg in history:
             # 修正：MongoDB存储格式为 {"role": "user"/"assistant", "text": "..."}
             role = msg.get("role")
             text = msg.get("text")
+            piece = ""
             if role == "user" and text:
-                history_str += f"用户: {text}\n"
+                piece = f"用户: {text}\n"
             elif role == "assistant" and text:
-                history_str += f"助手: {text}\n"
-
-            used += len(history_str) + 2
-            if used > MAX_CONTEXT_CHARS:
-                break
-    else:
+                piece = f"助手: {text}\n"
+            if piece:
+                used_history += len(piece) + 2
+                if used_history > history_budget:
+                    break
+                history_str += piece
+    if not history_str:
         history_str = "无历史对话"
 
     # 4. 格式化 Item Names (提问商品)

@@ -35,12 +35,26 @@ def get_bge_m3_ef():
 
     try:
         # 初始化BGE-M3模型，开启原生L2归一化（适配Milvus IP内积检索）
-        _bge_m3_ef = BGEM3EmbeddingFunction(
-            model_name=model_name,
-            device=device,
-            use_fp16=use_fp16,
-            normalize_embeddings=True  # 模型原生对稠密+稀疏向量做L2归一化
-        )
+        try:
+            _bge_m3_ef = BGEM3EmbeddingFunction(
+                model_name=model_name,
+                device=device,
+                use_fp16=use_fp16,
+                normalize_embeddings=True  # 模型原生对稠密+稀疏向量做L2归一化
+            )
+        except Exception as e:
+            # GPU 初始化失败（如显存不足/驱动异常）：自动降级为 CPU + FP32 重试
+            if device.startswith("cuda"):
+                logger.warning(
+                    f"BGE-M3 在 {device} 上初始化失败（{e}），自动降级为 CPU + FP32 重试")
+                _bge_m3_ef = BGEM3EmbeddingFunction(
+                    model_name=model_name,
+                    device="cpu",
+                    use_fp16=False,
+                    normalize_embeddings=True
+                )
+            else:
+                raise
         logger.success("BGE-M3模型初始化成功，已开启原生L2归一化")
         return _bge_m3_ef
     except Exception as e:

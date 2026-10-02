@@ -5,8 +5,26 @@
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? ''
 
+// 统一请求超时：避免长时间白屏无反馈
+const REQUEST_TIMEOUT_MS = 30_000
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    return await fetch(url, { ...options, signal: controller.signal })
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      throw new Error(`请求超时（${timeoutMs / 1000}s）：${url}`)
+    }
+    throw err
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 export async function postQuery(query, sessionId = null, isStream = true) {
-  const res = await fetch(`${API_BASE}/query`, {
+  const res = await fetchWithTimeout(`${API_BASE}/query`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -112,7 +130,7 @@ export function streamQuery(query, sessionId, handlers = {}) {
 }
 
 export async function fetchHistory(sessionId, limit = 50) {
-  const res = await fetch(`${API_BASE}/history/${sessionId}?limit=${limit}`)
+  const res = await fetchWithTimeout(`${API_BASE}/history/${sessionId}?limit=${limit}`)
   if (!res.ok) throw new Error('获取历史失败')
   return res.json()
 }

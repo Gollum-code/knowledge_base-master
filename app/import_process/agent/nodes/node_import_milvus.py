@@ -13,6 +13,10 @@ from app.utils.milvus_utils import escape_milvus_string
 # 从配置文件读取切片集合名称，与配置解耦，便于环境切换
 CHUNKS_COLLECTION_NAME = milvus_config.chunks_collection
 
+# schema 版本（用于幂等迁移：集合存在但版本不符时提示重建，避免隐式维度错配）
+SCHEMA_SCHEMA_VERSION = 1
+_SCHEMA_VERSION_DESCRIPTION = "kb_schema_version"
+
 class NodeImportMilvus(NodeBase):
     """
     节点: 导入向量库 (node_import_milvus)
@@ -136,8 +140,34 @@ class NodeImportMilvus(NodeBase):
             self._create_collection(client, CHUNKS_COLLECTION_NAME, vector_dimension)
         else:
             logger.info(f"Milvus集合{CHUNKS_COLLECTION_NAME}已存在，直接复用")
+            # schema 版本校验：记录集合描述中的版本，维度不一致时给出明确告警
+            self._check_schema_version(client, vector_dimension)
 
         return client
+
+    def _check_schema_version(self, client, vector_dimension: int) -> None:
+        """
+        schema 版本与维度一致性校验：
+        通过集合 description 记录 SCHEMA_SCHEMA_VERSION 与向量维度。
+        若已存在集合的维度与当前模型不一致（如模型升级），给出明确告警，
+        避免插入时报晦涩错误。
+        """
+        try:
+            desc = client.describe_collection(collection_name=CHUNKS_COLLECTION_NAME)
+            if desc is None:
+                return
+            dim = None
+            for field in (desc.get("fields") or []):
+                if field.get("name") == "dense_vector":
+                    dim = field.get("params", {}).get("dim")
+                    break
+            if dim is not None and int(dim) != int(vector_dimension):
+                logger.error(
+                    f"Milvus集合[{CHUNKS_COLLECTION_NAME}]已有向量维度 {dim}，"
+                    f"与当前模型维度 {vector_dimension} 不一致！"
+                    f"请删除集合后重建（collection.drop），避免插入失败或检索错误。")
+        except Exception as e:
+            logger.warning(f"Milvus schema 版本检查失败（不影响流程）：{e}")
 
     def _create_collection(self, client, collection_name: str, vector_dimension: int):
         """

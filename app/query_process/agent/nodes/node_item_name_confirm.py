@@ -14,11 +14,16 @@ from app.lm.embedding_utils import generate_embeddings
 from app.clients.milvus_utils import get_milvus_client, create_hybrid_search_requests, hybrid_search
 from dotenv import load_dotenv,find_dotenv
 from app.core.logger import logger
+from app.conf.settings import settings
 
 load_dotenv(find_dotenv())
 
 # 历史消息条数常量（替代硬编码）
 HISTORY_LIMIT = 10
+
+# 商品对齐阈值（从集中配置读取，便于离线调参）
+CONFIRM_HIGH_SCORE = settings.item_confirm_high_score   # 高置信度（直接确认）
+CONFIRM_LOW_SCORE = settings.item_confirm_low_score     # 中置信度（列为候选）
 
 
 def node_item_name_confirm(state: QueryGraphState) -> QueryGraphState:
@@ -321,17 +326,17 @@ def step_5_align_item_names(query_results) -> dict:
         # 对匹配结果按评分**降序**排序（高分在前，优先取相似度高的）
         matches.sort(key=lambda x: x.get("score", 0), reverse=True)
 
-        # 筛选高置信度匹配结果：评分>0.85
-        high = [m for m in matches if m.get("score", 0) > 0.85]
-        # 筛选中置信度匹配结果：评分≥0.6（仅高置信度为空时生效）
-        mid = [m for m in matches if m.get("score", 0) >= 0.6]
+        # 筛选高置信度匹配结果：评分>CONFIRM_HIGH_SCORE
+        high = [m for m in matches if m.get("score", 0) > CONFIRM_HIGH_SCORE]
+        # 筛选中置信度匹配结果：评分≥CONFIRM_LOW_SCORE（仅高置信度为空时生效）
+        mid = [m for m in matches if m.get("score", 0) >= CONFIRM_LOW_SCORE]
 
-        # 规则a: 只有一个高置信度结果（>0.85）→ 直接确认该商品名
+        # 规则a: 只有一个高置信度结果（>CONFIRM_HIGH_SCORE）→ 直接确认该商品名
         if len(high) == 1:
             confirmed_item_names.append(high[0].get("item_name"))
             continue  # 匹配到规则a，跳过后续规则判断
 
-        # 规则b: 多条高置信度结果（>0.85）
+        # 规则b: 多条高置信度结果（>CONFIRM_HIGH_SCORE）
         if len(high) > 1:
             # 初始化选中结果为None，优先匹配原始提取名
             picked = None
@@ -349,14 +354,14 @@ def step_5_align_item_names(query_results) -> dict:
             confirmed_item_names.append(picked.get("item_name"))
             continue  # 匹配到规则b，跳过后续规则判断
 
-        # 规则c: 无0.85分以上结果，取≥0.6分的最高前5个作为候选
+        # 规则c: 无高置信度结果，取≥CONFIRM_LOW_SCORE的最高前5个作为候选
         # 注：高置信度列表high为空时才会走到此处（规则a/b均不满足）
         if len(mid) > 0:
             # 取中置信度结果的前5个，加入候选列表
             for m in mid[:5]:
                 options.append(m.get("item_name"))
 
-        # 规则d: 无0.6分及以上结果 → 不做任何操作，确认+候选列表均为空
+        # 规则d: 无≥CONFIRM_LOW_SCORE结果 → 不做任何操作，确认+候选列表均为空
      # 返回最终对齐结果：确认列表和候选列表均做去重处理（list(set())）
     return {
         "confirmed_item_names": list(set(confirmed_item_names)),  # 去重，避免重复确认

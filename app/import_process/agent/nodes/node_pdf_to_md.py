@@ -9,6 +9,8 @@ from app.conf.mineru_config import mineru_config
 from app.import_process.agent.node_base import NodeBase
 from app.import_process.agent.state import ImportGraphState
 from app.core.logger import logger
+from app.core.trace import timing
+from app.utils.retry_utils import with_retry
 
 
 class NodePdfToMd(NodeBase):
@@ -32,22 +34,23 @@ class NodePdfToMd(NodeBase):
         :return:  md_path(pdf转成md后存储的路径)、md_content(md文件的内容)
         """
 
-        # 1：校验PDF路径和输出目录
-        pdf_path_obj, output_dir_obj = self._step_1_validate_paths(state)
+        with timing("node_pdf_to_md(内含MinerU上传+轮询+下载)"):
+            # 1：校验PDF路径和输出目录
+            pdf_path_obj, output_dir_obj = self._step_1_validate_paths(state)
 
-        # 步骤2：上传PDF至MinerU并轮询解析结果
-        zip_url = self._step_2_upload_and_poll(pdf_path_obj, output_dir_obj)
+            # 步骤2：上传PDF至MinerU并轮询解析结果
+            zip_url = self._step_2_upload_and_poll(pdf_path_obj, output_dir_obj)
 
-        # 步骤3：下载ZIP包并解压提取MD文件
-        md_path = self._step_3_download_and_extract(zip_url, output_dir_obj, pdf_path_obj.stem)
+            # 步骤3：下载ZIP包并解压提取MD文件
+            md_path = self._step_3_download_and_extract(zip_url, output_dir_obj, pdf_path_obj.stem)
 
-        # 步骤 4：读取内容 (如果文件不存在或编码错误，直接抛出异常，由外层捕获)
-        with open(md_path, "r", encoding="utf-8") as f:
-            md_content = f.read()
+            # 步骤 4：读取内容 (如果文件不存在或编码错误，直接抛出异常，由外层捕获)
+            with open(md_path, "r", encoding="utf-8") as f:
+                md_content = f.read()
 
-        # 更新状态
-        state["md_path"] = str(md_path)
-        state["md_content"] = md_content
+            # 更新状态
+            state["md_path"] = str(md_path)
+            state["md_content"] = md_content
 
         return state
 
@@ -109,18 +112,21 @@ class NodePdfToMd(NodeBase):
             "Authorization": f"Bearer {mineru_config.api_token}"
         }
 
-        # 1. 调用批量接口，获取上传Signed URL和任务batch_id
+        # 1. 调用批量接口，获取上传Signed URL和任务batch_id（瞬时失败自动重试）
         url_get_upload = f"{mineru_config.base_url}/file-urls/batch"
         req_data = {
             "files": [{"name": pdf_path_obj.name}],
             "model_version": "vlm"  # 官方推荐解析模型
         }
         logger.info(f"[获取上传链接] 调用接口：{url_get_upload}，请求参数：{req_data}")
-        resp = requests.post(url=url_get_upload, headers=request_headers, json=req_data, timeout=30)
 
-        # 响应校验：先验HTTP状态，再验业务返回码
-        if resp.status_code != 200:
-            raise RuntimeError(f"[获取上传链接] 网络请求失败，状态码：{resp.status_code}，响应内容：{resp.text}")
+        def _request_upload_url():
+            resp = requests.post(url=url_get_upload, headers=request_headers, json=req_data, timeout=30)
+            if resp.status_code != 200:
+                raise RuntimeError(f"[获取上传链接] 网络请求失败，状态码：{resp.status_code}，响应内容：{resp.text}")
+            return resp
+
+        resp = with_retry(_request_upload_url, max_attempts=3)
 
         resp_data = resp.json()
         if resp_data["code"] != 0:

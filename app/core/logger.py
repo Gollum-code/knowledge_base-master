@@ -42,10 +42,13 @@ LOG_FILE_PATH = LOG_DIR / LOG_FILE_NAME
 # <green> 等标签是 loguru 自带的颜色控制
 # {time} 时间, {level} 级别, {name} 文件名, {line} 行号, {message} 日志内容
 # : <30 表示左对齐并占位30个字符，确保日志排列整齐
+# 说明：extra[trace_id] 由下方 fix_log_position patcher 兜底注入（无请求时为 "-"），
+# 因此格式中引用 {extra[trace_id]} 是安全的，且在 enqueue=True 下也一致生效。
 LOG_FORMAT = (
     "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
     "<level>{level: <8}</level> | "
-    "<cyan>{name: <30}</cyan>:<cyan>{line: <4}</cyan> - "
+    "<cyan>{name: <30}</cyan>:<cyan>{line: <4}</cyan> | "
+    "<magenta>tid={extra[trace_id]: <12}</magenta> - "
     "<level>{message}</level>"
 )
 
@@ -96,6 +99,13 @@ base_logger = init_logger()
 
 def fix_log_position(record):
     """遍历调用栈，跳过loguru内部帧+工具类自身帧，提取业务代码实际调用位置"""
+    # 从 contextvars 读取 trace_id 注入日志 extra，实现按请求追踪（永远兜底为 "-"）
+    try:
+        from app.core.trace import current_trace_id
+        tid = current_trace_id() or "-"
+    except Exception:
+        tid = "-"
+    record["extra"]["trace_id"] = tid
     for frame in inspect.stack():
         # 终极过滤：排除loguru内部 + 排除工具类logger.py自身，直接定位业务模块
         if ("_logger.py" in frame.filename or frame.function == "_log") or "logger.py" in frame.filename:

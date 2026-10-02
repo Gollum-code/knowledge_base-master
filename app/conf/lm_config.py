@@ -16,11 +16,15 @@ class LLMConfig:
     lv_model: str
     llm_model: str
     llm_temperature: float
+    llm_timeout: float      # 单次请求超时（秒）
+    llm_max_retries: int    # 瞬时失败重试次数
 
 lm_config = LLMConfig(
     base_url=os.getenv("OPENAI_BASE_URL"),
     api_key=os.getenv("OPENAI_API_KEY"),
     lv_model=os.getenv("VL_MODEL"),
     llm_model=os.getenv("LLM_DEFAULT_MODEL"),
-    llm_temperature=float(os.getenv("LLM_DEFAULT_TEMPERATURE"))
+    llm_temperature=float(os.getenv("LLM_DEFAULT_TEMPERATURE") or 0.1),
+    llm_timeout=float(os.getenv("LLM_TIMEOUT") or 60),
+    llm_max_retries=int(os.getenv("LLM_MAX_RETRIES") or 2),
 )

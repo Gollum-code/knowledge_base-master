@@ -4,13 +4,14 @@ from typing import List, Dict, Any
 from datetime import datetime
 import uvicorn
 # 第三方库
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 # 项目内部工具/配置/客户端
 from app.clients.minio_utils import get_minio_client
+from app.conf.minio_config import minio_config
 from app.utils.path_util import PROJECT_ROOT
 from app.utils.task_utils import (
     add_running_task,
@@ -27,6 +28,7 @@ from app.utils.sse_utils import create_sse_queue, get_sse_queue, sse_generator, 
 from app.import_process.agent.state import get_default_state
 from app.import_process.agent.main_graph import kb_import_app  # LangGraph全流程编译实例
 from app.core.logger import logger  # 项目统一日志工具
+from app.core.trace import set_trace_id, TraceContext
 
 
 # 初始化FastAPI应用实例
@@ -131,9 +133,11 @@ def run_graph_task(task_id: str, local_dir: str, local_file_path: str):
         init_state["is_stream"] = True
 
         # 3. 流式执行 LangGraph 全流程（节点内通过 SSE 推送进度）
-        for event in kb_import_app.stream(init_state):
-            for node_name in event:
-                logger.info(f"[{task_id}] LangGraph节点执行完成：{node_name}")
+        #    后台线程不继承 contextvars，需显式恢复 trace_id
+        with TraceContext(task_id):
+            for event in kb_import_app.stream(init_state):
+                for node_name in event:
+                    logger.info(f"[{task_id}] LangGraph节点执行完成：{node_name}")
 
         # 4. 全流程执行完成
         update_task_status(task_id, TASK_STATUS_COMPLETED, push_queue=True)
@@ -315,6 +319,32 @@ async def stream_task_progress(task_id: str, request: Request):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.post("/presign-upload", summary="获取文件直传预签名URL", description="返回 MinIO 预签名 PUT URL，前端可直接上传文件到对象存储，减少服务端中转带宽")
+async def presign_upload(filename: str = Query(...)):
+    """
+    图片/文件直传预签名接口：
+    前端携带文件名调用本接口，得到一次性 PUT URL 与最终对象名，
+    随后浏览器直接 PUT 到 MinIO，避免经服务端转发占用带宽。
+    默认仅允许图片目录（与 MinIO 只读策略一致），生产可扩展为任意前缀。
+    """
+    raw = (filename or "").replace("\\", "/").split("/")[-1].strip()
+    if not raw or raw in (".", ".."):
+        raise HTTPException(status_code=400, detail="非法文件名")
+    client = get_minio_client()
+    if client is None:
+        raise HTTPException(status_code=500, detail="MinIO service connection failed, please check MinIO config")
+    bucket = minio_config.bucket_name or os.getenv("MINIO_BUCKET_NAME", "knowledge-base-files")
+    # 图片直传目录：配置前缀 + 当前日期，与 node_md_img 存储结构保持一致
+    img_dir = (minio_config.minio_img_dir or os.getenv("MINIO_IMG_DIR", "/upload-images")).lstrip("/")
+    object_name = f"{img_dir}/{datetime.now().strftime('%Y%m%d')}/{raw}"
+    try:
+        url = client.presigned_put_object(bucket_name=bucket, object_name=object_name, expires=3600)
+    except Exception as e:
+        logger.error(f"生成预签名URL失败：{e}")
+        raise HTTPException(status_code=500, detail=f"presign error: {e}")
+    return {"presigned_url": url, "object_name": object_name, "bucket": bucket}
 
 
 # --------------------------

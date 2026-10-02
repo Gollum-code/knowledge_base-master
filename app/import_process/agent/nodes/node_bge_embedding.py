@@ -1,6 +1,7 @@
 from typing import List, Any, Dict
 
 from app.core.logger import logger
+from app.conf.settings import settings
 from app.import_process.agent.node_base import NodeBase
 from app.import_process.agent.state import ImportGraphState, create_default_state
 from app.lm.embedding_utils import get_bge_m3_ef, generate_embeddings
@@ -125,8 +126,8 @@ class NodeBgeEmbedding(NodeBase):
         """
         # 初始化结果列表，存储带向量的切片数据
         output_data = []
-        # 批次大小配置：平衡显存占用和处理效率，建议根据实际环境调整
-        batch_size = 5
+        # 批次大小配置：平衡显存占用和处理效率，从集中配置读取（默认5，可按显存调整）
+        batch_size = settings.bge_batch_size
 
         # 按批次遍历，避免一次性处理过多数据导致显存溢出（OOM）
         total = len(texts_to_embed)

@@ -267,12 +267,14 @@ class NodeDocumentSplit(NodeBase):
             body = body[body.find(title) + len(title):].lstrip()
 
         # 初始化LangChain递归分割器（核心工具：按优先级分隔符切分，保留语义）
-        # separators：分割符优先级（从粗到细），优先按大语义单元切分，最后才硬拆
+        # separators：分割符优先级（从粗到细），优先按大语义单元切分，最后用空串硬拆
+        # 注意：末尾的空串 "" 是 LangChain 硬切兜底——当文本不含任何分隔符时
+        # （如连续无标点的长中文串），保证按 chunk_size 强制切分而不是返回整段超长块。
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=available_len,  # 正文部分最大长度（已扣除标题）
             chunk_overlap=0,  # 无重叠：按标题切分后语义完整，无需重叠
-            # 分割符优先级：空行(段落)→换行→中文标点→英文标点→空格，最后硬拆
-            separators=["\n\n", "\n", "。", "！", "？", "；", ".", "!", "?", ";", " "],
+            # 分割符优先级：空行(段落)→换行→中文标点→英文标点→空格→字符级硬拆
+            separators=["\n\n", "\n", "。", "！", "？", "；", ".", "!", "?", ";", " ", ""],
         )
 
         # 切分正文并组装子章节（带完整元信息，便于溯源）

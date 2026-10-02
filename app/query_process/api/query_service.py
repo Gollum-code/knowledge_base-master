@@ -15,6 +15,7 @@ from app.utils.sse_utils import create_sse_queue, remove_sse_queue, SSEEvent, ss
 from app.clients.mongo_history_utils import *
 from app.query_process.agent.main_graph import query_app
 from app.core.logger import logger
+from app.core.trace import set_trace_id, current_trace_id, TraceContext
 
 # 后续导入启动图对象
 #from app.query_process.main_graph import query_app
@@ -105,6 +106,9 @@ async def query(background_tasks: BackgroundTasks, request: QueryRequest):
         raise HTTPException(status_code=422, detail="查询内容不能为空")
     session_id = request.session_id if request.session_id else str(uuid.uuid4())
 
+    # 生成请求级 trace_id（贯穿整个查询链路，便于日志追踪）
+    set_trace_id(session_id)
+
     # 处理是不是流式返回结果
     is_stream = request.is_stream
     if is_stream:
@@ -153,8 +157,10 @@ def run_query_graph(session_id: str, user_query: str, is_stream: bool = True):
 
     default_state = {"original_query": user_query, "session_id": session_id, "is_stream": is_stream}
     try:
-        # 后期运行
-        query_app.invoke(default_state)
+        # 后台线程内显式恢复 trace_id（BackgroundTasks 线程不继承 contextvars）
+        with TraceContext(session_id):
+            # 后期运行
+            query_app.invoke(default_state)
         # 整体任务就更新完了！ 接下来就是数据的更新了！
         update_task_status(session_id, TASK_STATUS_COMPLETED, is_stream)
     except Exception as e:

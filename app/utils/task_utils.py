@@ -1,37 +1,80 @@
-from typing import Dict, List
+"""
+任务状态追踪（支持可选 Redis 持久化后端）
+=========================================
+对外保持原有函数式接口不变（add_done_task / get_task_status 等）。
+
+存储后端：
+- 默认：进程内存（单进程演示/开发，零依赖、高性能）
+- 可选：Redis（配置 REDIS_URL 且 redis 库可用时自动启用），
+  支持多 worker 部署与重启后状态恢复
+
+线程安全：读-改-写临界区使用模块级锁保护。
+"""
+import json
+import threading
+import time
 from time import time
+from typing import Dict, List, Optional
+
 from .sse_utils import push_to_session
 
-# ---------------------------
-# 内存态任务追踪（单进程）
-# ---------------------------
-# key: task_id
-# value: 节点名列表（原始英文/节点ID）
-_tasks_running_list: Dict[str, List[str]] = {}
-_tasks_done_list: Dict[str, List[str]] = {}
 
-# key: task_id
-# value: status 字符串（如 pending/processing/completed/failed）
-_tasks_status: Dict[str, str] = {}
+def _load_task_data(task_id: str) -> Optional[dict]:
+    """从后端读取任务数据（Redis 返回深拷贝副本；内存返回原引用）。"""
+    if _BACKEND_REDIS:
+        raw = _r.get(f"kb:task:{task_id}")
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+    return _mem_tasks.get(task_id)
 
-# key: task_id
-# value: 任务结果（例如 query 的 answer）
-_tasks_result: Dict[str, Dict[str, str]] = {}
 
-# key: task_id
-# value: 任务创建时间戳（用于过期清理，防止内存无限增长）
-_tasks_created_at: Dict[str, float] = {}
+def _save_task_data(task_id: str, data: dict) -> None:
+    if _BACKEND_REDIS:
+        _r.set(f"kb:task:{task_id}", json.dumps(data, ensure_ascii=False, default=str),
+               ex=settings.task_data_retention_seconds)
+    # 内存模式：data 是原引用，原地修改即已生效，无需写回
 
-# 任务数据保留时长（秒）：超过后自动清理，默认 1 小时
-TASK_DATA_RETENTION_SECONDS = 3600
+
+def _init_backend():
+    """初始化存储后端。"""
+    global _BACKEND_REDIS, _r, settings
+    from app.conf.settings import settings  # noqa: F811
+    if settings.redis_url:
+        try:
+            import redis as _redis_mod
+            client = _redis_mod.Redis.from_url(settings.redis_url,
+                                               decode_responses=True, socket_timeout=3)
+            client.ping()
+            _r = client
+            _BACKEND_REDIS = True
+            return
+        except Exception as e:
+            from app.core.logger import logger
+            logger.warning(f"Redis 不可用，任务状态回退内存后端：{e}")
+    _BACKEND_REDIS = False
+    _r = None
+
+
+# 内存后端存储：task_id -> dict
+_mem_tasks: Dict[str, dict] = {}
+_r = None
+_BACKEND_REDIS = False
+_lock = threading.Lock()
+settings = None
 
 TASK_STATUS_PENDING = "pending"
 TASK_STATUS_PROCESSING = "processing"
 TASK_STATUS_COMPLETED = "completed"
 TASK_STATUS_FAILED = "failed"
 
+# 任务数据保留时长（秒）：超过后自动清理（内存后端懒触发清理；Redis 依赖 TTL）
+TASK_DATA_RETENTION_SECONDS = 3600
+
 # 节点名 -> 中文名映射（用于前端展示）
-# 说明：这里的 key 应与 LangGraph 的 add_node("xxx", ...) 中的节点名一致。
 _NODE_NAME_TO_CN: Dict[str, str] = {
     "upload_file": "开始上传文件",
     "node_entry": "检查文件",
@@ -44,7 +87,7 @@ _NODE_NAME_TO_CN: Dict[str, str] = {
     "node_import_milvus": "导入向量库",
     "__end__": "处理完成",
     "END": "处理完成",
-    # --- Query 流程节点（kb/query_process/main_graph.py）---
+    # --- Query 流程节点 ---
     "node_item_name_confirm": "确认问题产品",
     "node_answer_output": "生成答案",
     "node_rerank": "重排序",
@@ -58,142 +101,96 @@ _NODE_NAME_TO_CN: Dict[str, str] = {
 }
 
 
-def _ensure_task(task_id: str) -> None:
-    """确保 task_id 对应的数据结构已初始化。"""
-    if task_id not in _tasks_running_list:
-        _tasks_running_list[task_id] = []
-    if task_id not in _tasks_done_list:
-        _tasks_done_list[task_id] = []
-    if task_id not in _tasks_result:
-        _tasks_result[task_id] = {}
-    if task_id not in _tasks_created_at:
-        _tasks_created_at[task_id] = time()
-
-
-def _cleanup_expired_tasks() -> None:
-    """清理超过保留时长的任务数据，避免内存无限增长（懒触发）。"""
-    if not _tasks_created_at:
-        return
-    now = time()
-    expired = [
-        tid for tid, ts in _tasks_created_at.items()
-        if now - ts > TASK_DATA_RETENTION_SECONDS
-    ]
-    for tid in expired:
-        clear_task(tid)
+def _get_or_create(task_id: str) -> dict:
+    """读取任务数据，不存在则创建空结构。返回值在锁内可直接原地修改。"""
+    data = _load_task_data(task_id)
+    if data is None:
+        data = {
+            "running": [],
+            "done": [],
+            "status": "",
+            "result": {},
+            "created_at": time(),
+        }
+        if _BACKEND_REDIS:
+            # Redis 模式：先保存才能拿到唯一副本
+            _save_task_data(task_id, data)
+            data = _load_task_data(task_id)
+        else:
+            _mem_tasks[task_id] = data
+    return data
 
 
 def _to_cn(node_name: str) -> str:
-    """将节点名转换为中文展示名；若无映射则返回原名。"""
     return _NODE_NAME_TO_CN.get(node_name, node_name)
 
 
 def add_running_task(task_id: str, node_name: str, is_stream: bool = False) -> None:
-    """
-    添加“正在运行”的节点任务。
-
-    参数：
-    - task_id: 任务ID
-    - node_name: 节点名称(节点ID)
-    """
-    _ensure_task(task_id)
-    running = _tasks_running_list[task_id]
-    # 避免重复追加
-    if node_name not in running:
-        running.append(node_name)
-
-    if is_stream:
-        task_push_queue(task_id)
+    with _lock:
+        data = _get_or_create(task_id)
+        running = data["running"]
+        if node_name not in running:
+            running.append(node_name)
+            _save_task_data(task_id, data)
+        if is_stream:
+            task_push_queue(task_id)
 
 
 def add_done_task(task_id: str, node_name: str, is_stream: bool = False) -> None:
-    """
-    添加“已完成”的节点任务。
-
-    注意：添加已完成任务时，会把同名的“正在运行”任务删除。
-
-    参数：
-    - task_id: 任务ID
-    - node_name: 节点名称(节点ID)
-    """
-    _ensure_task(task_id)
-
-    # 1) 从 running 中移除同名节点（可能出现重复，移除所有）
-    running = _tasks_running_list[task_id]
-    _tasks_running_list[task_id] = [n for n in running if n != node_name]
-
-    # 2) 追加到 done（保持完成顺序），避免重复
-    done = _tasks_done_list[task_id]
-    if node_name not in done:
-        done.append(node_name)
-
-    if is_stream:
-        task_push_queue(task_id)
+    with _lock:
+        data = _get_or_create(task_id)
+        data["running"] = [n for n in data["running"] if n != node_name]
+        done = data["done"]
+        if node_name not in done:
+            done.append(node_name)
+        _save_task_data(task_id, data)
+        if is_stream:
+            task_push_queue(task_id)
 
 
 def set_task_result(task_id: str, key: str, value: str) -> None:
-    """
-    存储任务结果字段（如 answer / error）。
-    """
-    _ensure_task(task_id)
-    _tasks_result[task_id][key] = value
+    with _lock:
+        data = _get_or_create(task_id)
+        data["result"][key] = value
+        _save_task_data(task_id, data)
 
 
 def get_task_result(task_id: str, key: str, default: str = "") -> str:
-    """
-    获取任务结果字段（如 answer / error）。
-    """
-    _ensure_task(task_id)
-    return _tasks_result.get(task_id, {}).get(key, default)
+    with _lock:
+        data = _get_or_create(task_id)
+        return data["result"].get(key, default)
 
 
 def get_task_status(task_id: str) -> str:
-    """
-    获取当前任务状态。
-
-    参数：
-    - task_id: 任务ID
-
-    返回：
-    - str: 状态名称；如果未设置过则返回空字符串
-    """
-    return _tasks_status.get(task_id, "")
+    data = _load_task_data(task_id)
+    if data is None:
+        return ""
+    return data.get("status", "")
 
 
 def get_done_task_list(task_id: str) -> List[str]:
-    """
-    获取已完成节点列表（中文展示）。
-
-
-    """
-    _ensure_task(task_id)
-    done = _tasks_done_list.get(task_id, [])
-    return [_to_cn(n) for n in done]
+    data = _load_task_data(task_id)
+    if data is None:
+        return []
+    return [_to_cn(n) for n in data.get("done", [])]
 
 
 def get_running_task_list(task_id: str) -> List[str]:
-    """
-    获取正在运行节点列表（中文展示）。
-
-    """
-    _ensure_task(task_id)
-    running = _tasks_running_list.get(task_id, [])
-    return [_to_cn(n) for n in running]
+    data = _load_task_data(task_id)
+    if data is None:
+        return []
+    return [_to_cn(n) for n in data.get("running", [])]
 
 
 def update_task_status(task_id: str, status_name: str, push_queue: bool = False) -> None:
-    """
-    更新任务状态。
-
-    参数：
-    - task_id: 任务ID
-    - status_name: 状态名称（字符串）
-    """
-    _tasks_status[task_id] = status_name
-    # 懒触发过期任务清理，避免长期运行内存无限增长
-    _cleanup_expired_tasks()
-    if push_queue:
-        task_push_queue(task_id)
+    with _lock:
+        data = _get_or_create(task_id)
+        data["status"] = status_name
+        _save_task_data(task_id, data)
+        if not _BACKEND_REDIS:
+            _cleanup_expired_tasks()
+        if push_queue:
+            task_push_queue(task_id)
 
 
 def task_push_queue(task_id: str):
@@ -204,12 +201,26 @@ def task_push_queue(task_id: str):
     })
 
 
-#
 def clear_task(task_id: str):
-    _tasks_running_list.pop(task_id, None)
-    _tasks_done_list.pop(task_id, None)
-    _tasks_status.pop(task_id, None)
-    _tasks_result.pop(task_id, None)
-    _tasks_created_at.pop(task_id, None)
+    with _lock:
+        _mem_tasks.pop(task_id, None)
+        if _BACKEND_REDIS:
+            try:
+                _r.delete(f"kb:task:{task_id}")
+            except Exception:
+                pass
 
 
+def _cleanup_expired_tasks() -> None:
+    """内存后端：清理超过保留时长的任务数据。"""
+    if not _mem_tasks:
+        return
+    now = time()
+    expired = [tid for tid, data in _mem_tasks.items()
+               if now - data.get("created_at", 0) > TASK_DATA_RETENTION_SECONDS]
+    for tid in expired:
+        _mem_tasks.pop(tid, None)
+
+
+# 初始化存储后端
+_init_backend()
